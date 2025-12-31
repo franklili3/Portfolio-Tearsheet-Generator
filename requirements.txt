@@ -1,0 +1,4 @@
+pandas_market_calendars==4.1.4
+quantstats==0.0.77
+plotly==6.5.0
+yfinance==0.1.74
