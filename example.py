@@ -141,7 +141,7 @@ from plotly.offline import plot
 from plotly.subplots import make_subplots
 import itertools
 import matplotlib.dates as mpl_dates
-#import yfinance as yf
+import yfinance as yf
 import quantstats as qs
 qs.extend_pandas()
 # import pdfkit
@@ -159,27 +159,92 @@ from pathlib import Path
 
 # %%
 def create_market_cal(start, end):
-  nyse = mcal.get_calendar('NYSE')
-  schedule = nyse.schedule(start, end)
-  market_cal = mcal.date_range(schedule, frequency='1D')
-  market_cal = market_cal.tz_localize(None)
-  market_cal = [i.replace(hour=0) for i in market_cal]
-  return market_cal
+  """
+  Create a market calendar with trading days.
+  Falls back to pandas business_days if pandas_market_calendars has compatibility issues.
+  """
+  try:
+    nyse = mcal.get_calendar('NYSE')
+    schedule = nyse.schedule(start, end)
+    market_cal = mcal.date_range(schedule, frequency='1D')
+    market_cal = market_cal.tz_localize(None)
+    market_cal = [i.replace(hour=0) for i in market_cal]
+    return market_cal
+  except (TypeError, AttributeError) as e:
+    print(f"Warning: pandas_market_calendars error ({e}). Using simple business day calendar.")
+    print("This may include holidays that are actual market closures.\n")
+    # Fallback: use pandas business days (excludes weekends but may include some holidays)
+    start_dt = pd.to_datetime(start)
+    end_dt = pd.to_datetime(end)
+    market_cal = pd.bdate_range(start_dt, end_dt)  # Business days
+    market_cal = [i.replace(hour=0) for i in market_cal]
+    return market_cal
 
 # %% [markdown]
 # # ***Downloading YFinance Data***
 
 # %%
 
-def get_data(stocks, start, end):
+def get_data(stocks, start, end, use_sample_data=False):
+  import time
+
+  # If explicitly requested to use sample data or all downloads fail
+  if use_sample_data:
+    print("Using sample data for testing...")
+    from sample_stock_data import generate_sample_data
+    return generate_sample_data(stocks, start, end)
+
   def data(ticker):
     print(f'Getting data for {ticker}...')
-    df = yf.download(ticker, start=start, end=(datetime.datetime.strptime(end, "%Y-%m-%d") + datetime.timedelta(days=1)))
-    df['symbol'] = ticker
-    df.index = pd.to_datetime(df.index)
-    return df
-  datas = map(data,stocks)
-  return(pd.concat(datas, keys=stocks, names=['Ticker', 'Date'], sort=True))
+    # Ensure dates are in correct format for yfinance
+    start_dt = pd.to_datetime(start)
+    end_dt = pd.to_datetime(end) + datetime.timedelta(days=1)
+
+    # Add retry logic for rate limiting
+    max_retries = 2  # Reduced retries
+    for attempt in range(max_retries):
+      try:
+        df = yf.download(ticker, start=start_dt.strftime('%Y-%m-%d'), end=end_dt.strftime('%Y-%m-%d'), progress=False)
+        if df.empty:
+          print(f'Warning: No data found for {ticker}')
+          return None
+        df['symbol'] = ticker
+        df.index = pd.to_datetime(df.index)
+        return df
+      except Exception as e:
+        if attempt < max_retries - 1:
+          wait_time = 10
+          print(f'Rate limited. Waiting {wait_time} seconds before retry...')
+          time.sleep(wait_time)
+        else:
+          print(f'Error downloading {ticker}: {e}')
+          return None
+
+  datas = []
+  for i, stock in enumerate(stocks):
+    if i > 0:
+      # Add delay between requests to avoid rate limiting
+      print(f"Waiting 5 seconds to avoid rate limiting...")
+      time.sleep(5)
+    result = data(stock)
+    if result is not None:
+      datas.append(result)
+
+  # If all downloads failed, offer to use sample data
+  if not datas:
+    print("\n" + "="*60)
+    print("WARNING: All data downloads failed due to rate limiting.")
+    print("="*60)
+    print("\nOptions:")
+    print("1. Use sample/synthetic data for testing (recommended for development)")
+    print("2. Wait 1-2 hours for API rate limit to reset")
+    print("3. Run the script again later")
+    print("\nUsing sample data for now...\n")
+
+    from sample_stock_data import generate_sample_data
+    return generate_sample_data(stocks, start, end)
+
+  return pd.concat(datas, keys=stocks[:len(datas)], names=['Ticker', 'Date'], sort=True)
 
 
 # %% [markdown]
@@ -187,7 +252,7 @@ def get_data(stocks, start, end):
 
 # %%
 def read_csv(folder, csv_name):
-  portfolio_df = pd.read_csv(f'/content/drive/MyDrive/Colab Notebooks/{folder}/{csv_name}.csv')
+  portfolio_df = pd.read_csv(f'{folder}/{csv_name}.csv')
   portfolio_df['Open date'] = pd.to_datetime(portfolio_df['Open date'])
   return portfolio_df
 
@@ -213,7 +278,7 @@ def position_adjust(daily_positions, sale):
           position[1]["Closed Stock Gain / (Loss)"] += (sale[1]['Adj cost per share'] - position[1]['Adj cost per share']) * sale[1]['Qty']
           position[1]['Qty'] -= sale[1]['Qty']
           sale[1]['Qty'] -= sale[1]['Qty']
-      stocks_with_sales = stocks_with_sales.append(position[1])
+      stocks_with_sales = pd.concat([stocks_with_sales, position[1].to_frame().T], ignore_index=True)
   return stocks_with_sales
 
 def portfolio_start_balance(portfolio, start_date):
@@ -222,12 +287,14 @@ def portfolio_start_balance(portfolio, start_date):
   sales = positions_before_start[positions_before_start['Type'] == 'Sell.FIFO'].groupby(['Symbol'])['Qty'].sum()
   sales = sales.reset_index()
   positions_no_change = positions_before_start[~positions_before_start['Symbol'].isin(sales['Symbol'].unique())]
-  adj_positions_df = pd.DataFrame()
+  adj_positions_list = []
   for sale in sales.iterrows():
       adj_positions = position_adjust(positions_before_start, sale)
-      adj_positions_df = adj_positions_df.append(adj_positions)
-  adj_positions_df = adj_positions_df.append(positions_no_change)
-  adj_positions_df = adj_positions_df.append(future_positions)
+      if not adj_positions.empty:
+        adj_positions_list.append(adj_positions)
+  adj_positions_list.append(positions_no_change)
+  adj_positions_list.append(future_positions)
+  adj_positions_df = pd.concat(adj_positions_list, ignore_index=True)
   adj_positions_df = adj_positions_df[adj_positions_df['Qty'] > 0]
   return adj_positions_df
 
@@ -239,10 +306,13 @@ def fifo(daily_positions, sales, date):
   sales = sales[sales['Open date'] == date]
   daily_positions = daily_positions[daily_positions['Open date'] <= date]
   positions_no_change = daily_positions[~daily_positions['Symbol'].isin(sales['Symbol'].unique())]
-  adj_positions = pd.DataFrame()
+  adj_positions_list = []
   for sale in sales.iterrows():
-      adj_positions = adj_positions.append(position_adjust(daily_positions, sale))
-  adj_positions = adj_positions.append(positions_no_change)
+      adj = position_adjust(daily_positions, sale)
+      if not adj.empty:
+        adj_positions_list.append(adj)
+  adj_positions_list.append(positions_no_change)
+  adj_positions = pd.concat(adj_positions_list, ignore_index=True) if adj_positions_list else pd.DataFrame()
   return adj_positions
 
 def time_fill(portfolio, market_cal, stocks_end):
@@ -255,7 +325,7 @@ def time_fill(portfolio, market_cal, stocks_end):
       if (sales['Open date'] == date).any():
           future_txns = portfolio[(portfolio['Open date'] > date) & (portfolio['Open date'] <= stocks_end)]
           portfolio = fifo(portfolio, sales, date)
-          portfolio = portfolio.append(future_txns)
+          portfolio = pd.concat([portfolio, future_txns], ignore_index=True)
       daily_positions = portfolio[portfolio['Open date'] <= date]
       daily_positions = daily_positions[daily_positions['Type'] == 'Buy']
       daily_positions['Date Snapshot'] = date
@@ -332,8 +402,6 @@ def format_returns(pdpc):
   # Calculate ticker weighted returns
   grouped_metrics5['Ticker Weighted Return'] = grouped_metrics5['Weight'] * grouped_metrics5['Ticker Daily Return']
 
-  # display(grouped_metrics5)
-
   # Group by date and calculate total weighted returns
   grouped_metrics5 = grouped_metrics5.groupby('Date Snapshot')['Ticker Weighted Return'].sum().reset_index()
   grouped_metrics5.rename(columns={'Ticker Weighted Return': 'Total Weighted Return'}, inplace=True)
@@ -343,8 +411,6 @@ def format_returns(pdpc):
   grouped_metrics5['Total Weighted Return'].fillna(0, inplace=True)
   grouped_metrics5['Total Weighted Return'] = grouped_metrics5['Total Weighted Return'].replace([np.inf, -np.inf], 0)
   grouped_metrics5['Cumulative Total Weighted Return'] = (grouped_metrics5['Total Weighted Return'].cumsum() * 100).ffill()
-
-  # display(grouped_metrics5)
 
   # Plot Data
   # line(grouped_metrics5, 'Total Weighted Return')
@@ -398,17 +464,20 @@ def format_returns(pdpc):
 # These will help us see whats going on in the spreadsheet visually without generating the whole report.
 
 # %%
-def line_facets(df, val_1):
+def line_facets(df, val_1, output_dir=None):
     grouped_metrics = df.groupby(['Symbol','Date Snapshot'])[[val_1]].sum().reset_index()
     grouped_metrics = pd.melt(grouped_metrics, id_vars=['Symbol','Date Snapshot'],
                               value_vars=[val_1])
     fig = px.line(grouped_metrics, x="Date Snapshot", y="value",
                   color='variable', facet_col="Symbol", facet_col_wrap=10)
-    fig.write_html("lineGraph.html")
+    if output_dir:
+        fig.write_html(str(output_dir / "lineGraph.html"))
+    else:
+        fig.write_html("lineGraph.html")
     plot(fig)
     fig.show()
 
-def line(df, val_1):
+def line(df, val_1, output_dir=None):
     grouped_metrics = df.groupby(['Date Snapshot'])[[val_1]].sum().reset_index()
     grouped_metrics = pd.melt(grouped_metrics, id_vars=['Date Snapshot'],
                               value_vars=[val_1])
@@ -452,7 +521,7 @@ def assign_sectors(df):
   df['Sector'] = sectors
   return df
 
-def sector_perf(pdpc):
+def sector_perf(pdpc, output_dir):
 
   # Get SPY for Benchmarking
   benchmarks = ['SPY']
@@ -491,9 +560,7 @@ def sector_perf(pdpc):
 
     # Calculate ticker weighted returns
     grouped_metrics5['Ticker Weighted Return'] = grouped_metrics5['Weight'] * grouped_metrics5['Ticker Daily Return']
-    symbols_combined = symbols_combined.append(grouped_metrics5)
-
-    # display(grouped_metrics5)
+    symbols_combined = pd.concat([symbols_combined, grouped_metrics5], ignore_index=True)
 
     # Group by date and calculate total weighted returns
     grouped_metrics5 = grouped_metrics5.groupby('Date Snapshot')['Ticker Weighted Return'].sum().reset_index()
@@ -504,8 +571,6 @@ def sector_perf(pdpc):
     grouped_metrics5['Total Weighted Return'].fillna(0, inplace=True)
     grouped_metrics5['Total Weighted Return'] = grouped_metrics5['Total Weighted Return'].replace([np.inf, -np.inf], 0)
     grouped_metrics5['Cumulative Total Weighted Return'] = (grouped_metrics5['Total Weighted Return'].cumsum() * 100).ffill()
-
-    # display(grouped_metrics5)
 
     colors = (['red', 'green', 'blue', 'black', 'orange', 'darkviolet', 'slategrey', 'fuchsia', 'maroon', 'saddlebrown', 'greenyellow', 'cyan'])
     # Add plot to figure
@@ -554,7 +619,7 @@ def sector_perf(pdpc):
         height=600*2,
     )
 
-  fig_sector_performance.write_html(f"fig_sector_performance.html")
+  fig_sector_performance.write_html(str(output_dir / "fig_sector_performance.html"))
   fig_sector_performance.show()
 
   for sector in pdpc['Sector'].unique():
@@ -654,7 +719,7 @@ def sector_perf(pdpc):
         height=600*2,
     )
 
-    fig_individual_sector.write_html(f"fig_individual_sector_{sector}.html")
+    fig_individual_sector.write_html(str(output_dir / f"fig_individual_sector_{sector}.html"))
     fig_individual_sector.show()
 
 # %% [markdown]
@@ -663,8 +728,13 @@ def sector_perf(pdpc):
 # Utilize the QuantStats Library to generate a report for our Portfolio
 
 # %%
-def generate_report(folder, filename, start_date, sector='Portfolio', rf=0.):
+def generate_report(folder, filename, start_date, sector='Portfolio', rf=0.02):
   print("Reading Portfolio Transactions from .CSV...")
+
+  # Create output directory
+  output_dir = Path('./output')
+  output_dir.mkdir(parents=True, exist_ok=True)
+  print(f"Output will be saved to: {output_dir.absolute()}")
 
   portfolio_df = read_csv(folder, filename)
 
@@ -702,13 +772,12 @@ def generate_report(folder, filename, start_date, sector='Portfolio', rf=0.):
   pdpc = per_day_portfolio_calcs(positions_per_day, daily_adj_close, start_date)
 
   # Check Daily Snapshots in .csv format
-  filepath = Path(f'./PerDayPortfolioCalculations_{datetime.date.today()}.csv')
-  filepath.parent.mkdir(parents=True, exist_ok=True)
+  filepath = output_dir / f'PerDayPortfolioCalculations_{datetime.date.today()}.csv'
   pdpc.to_csv(filepath)
 
   print("Generating Sector Performance Plot")
 
-  sector_perf(pdpc)
+  sector_perf(pdpc, output_dir)
 
   print('Formatting Returns for QuantStats Library & Plotting Individual Sector Returns...')
 
@@ -719,40 +788,189 @@ def generate_report(folder, filename, start_date, sector='Portfolio', rf=0.):
   # Portfolio Metrics
   metrics = qs.reports.metrics(portReturns, 'SPY', rf=rf, display=False, mode='Full')
   metrics['Statistics'] = metrics.index
-  display(metrics)
-  metrics.to_csv(f"metrics_{sector}.csv")
+  print(metrics)
+  metrics.to_csv(output_dir / f"metrics_{sector}.csv")
 
   rolling_beta = qs.stats.rolling_greeks(portReturns, 'SPY')
-  display(rolling_beta)
-  rolling_beta.to_csv(f"rolling_beta_{sector}.csv")
+  print(rolling_beta)
+  rolling_beta.to_csv(output_dir / f"rolling_beta_{sector}.csv")
 
   rolling_sharpe = pd.DataFrame(qs.stats.rolling_sharpe(portReturns, rf=rf))
   rolling_sharpe.rename(columns={'Total Weighted Return':'Rolling Sharpe Ratio'}, inplace=True)
-  display(rolling_sharpe)
-  rolling_sharpe.to_csv(f"rolling_sharpe_{sector}.csv")
+  print(rolling_sharpe)
+  rolling_sharpe.to_csv(output_dir / f"rolling_sharpe_{sector}.csv")
 
   rolling_volatility = pd.DataFrame(qs.stats.rolling_volatility(portReturns))
   rolling_volatility.rename(columns={'Total Weighted Return':'Rolling Volatility'}, inplace=True)
-  display(rolling_volatility)
-  rolling_volatility.to_csv(f"rolling_volatility_{sector}.csv")
+  print(rolling_volatility)
+  rolling_volatility.to_csv(output_dir / f"rolling_volatility_{sector}.csv")
   # rolling_volatility = qs.plots.rolling_volatility(portReturns, 'SPY')
 
+  # Extract additional chart data for CSV export
+  print("Exporting additional chart data...")
+
+  # 1. Cumulative Returns Data
+  cumulative_returns = pd.DataFrame({
+      'Date': portReturns.index,
+      'Daily Return': portReturns.values,
+      'Cumulative Return': (1 + portReturns).cumprod().values - 1
+  })
+  cumulative_returns.set_index('Date', inplace=True)
+  cumulative_returns.to_csv(output_dir / f"cumulative_returns_{sector}.csv")
+  print(f"✓ Saved cumulative_returns_{sector}.csv")
+
+  # 2. EOY (End of Year) Returns
+  try:
+    # Calculate yearly returns manually
+    yearly_returns = portReturns.resample('Y').apply(lambda x: (1 + x).prod() - 1)
+    yearly_returns_df = pd.DataFrame({
+        'Year': yearly_returns.index.year,
+        'Strategy Return': yearly_returns.values * 100
+    })
+    yearly_returns_df.to_csv(output_dir / f"eoy_returns_{sector}.csv", index=False)
+    print(f"✓ Saved eoy_returns_{sector}.csv")
+  except Exception as e:
+    print(f"Warning: Could not export EOY returns: {e}")
+
+  # 3. Worst Drawdowns Data
+  try:
+    drawdown_series = qs.stats.to_drawdown_series(portReturns)
+    # Find drawdown periods
+    drawdown_df = pd.DataFrame(drawdown_series)
+    drawdown_df.columns = ['Drawdown']
+    drawdown_df.to_csv(output_dir / f"drawdown_series_{sector}.csv")
+    print(f"✓ Saved drawdown_series_{sector}.csv")
+  except Exception as e:
+    print(f"Warning: Could not export drawdown details: {e}")
+
+  # 4. Monthly Returns Heatmap Data
+  try:
+    monthly_returns = qs.stats.monthly_returns(portReturns, eoy=True)
+    monthly_returns.to_csv(output_dir / f"monthly_returns_heatmap_data_{sector}.csv")
+    print(f"✓ Saved monthly_returns_heatmap_data_{sector}.csv")
+  except Exception as e:
+    print(f"Warning: Could not export monthly returns heatmap data: {e}")
+
+  # 5. Daily Returns Data
+  daily_returns_df = pd.DataFrame({
+      'Date': portReturns.index,
+      'Daily Return': portReturns.values,
+      'Cumulative Returns': (1 + portReturns).cumprod().values - 1
+  })
+  daily_returns_df.to_csv(output_dir / f"daily_returns_data_{sector}.csv", index=False)
+  print(f"✓ Saved daily_returns_data_{sector}.csv")
+
+  # 6. Key Statistics Summary
+  try:
+    key_stats = pd.Series({
+        'Total Return': qs.stats.comp(portReturns),
+        'CAGR': qs.stats.cagr(portReturns),
+        'Sharpe Ratio': qs.stats.sharpe(portReturns, rf=rf),
+        'Sortino Ratio': qs.stats.sortino(portReturns, rf=rf),
+        'Max Drawdown': qs.stats.max_drawdown(portReturns),
+        'Volatility (Ann.)': qs.stats.volatility(portReturns),
+        'Win Rate': qs.stats.win_rate(portReturns),
+        'Best Day': qs.stats.best(portReturns),
+        'Worst Day': qs.stats.worst(portReturns),
+        'Avg Win': qs.stats.avg_win(portReturns),
+        'Avg Loss': qs.stats.avg_loss(portReturns),
+        'Profit Factor': qs.stats.profit_factor(portReturns)
+    })
+    key_stats.to_csv(output_dir / f"key_statistics_summary_{sector}.csv")
+    print(f"✓ Saved key_statistics_summary_{sector}.csv")
+  except Exception as e:
+    print(f"Warning: Could not export key statistics: {e}")
+
   # monthly_returns_heatmap = qs.stats.monthly_returns(portReturns, eoy=False)
-  monthly_returns_heatmap = qs.plots.monthly_returns(portReturns, savefig=f"monthly_returns_heatmap_{sector}.png")
+  monthly_returns_heatmap = qs.plots.monthly_returns(portReturns, savefig=str(output_dir / f"monthly_returns_heatmap_{sector}.png"))
 
   # monthly_returns_distribution = qs.stats.distribution(portReturns)
-  monthly_returns_distribution = qs.plots.histogram(portReturns, savefig=f"monthly_returns_distribution_{sector}.png")
+  monthly_returns_distribution = qs.plots.histogram(portReturns, savefig=str(output_dir / f"monthly_returns_distribution_{sector}.png"))
 
   # drawdown = qs.stats.to_drawdown_series(portReturns)
-  drawdown = qs.plots.drawdown(portReturns, savefig=f"drawdown_{sector}.png")
+  drawdown = qs.plots.drawdown(portReturns, savefig=str(output_dir / f"drawdown_{sector}.png"))
 
-  daily_returns = qs.plots.daily_returns(portReturns, 'SPY', savefig=f"daily_returns_{sector}.png")
+  daily_returns = qs.plots.daily_returns(portReturns, 'SPY', savefig=str(output_dir / f"daily_returns_{sector}.png"))
+
+  # Generate additional charts from QuantStats
+  print("Generating additional QuantStats charts...")
+
+  # 1. Cumulative Returns Chart
+  try:
+    qs.plots.returns(portReturns, 'SPY', savefig=str(output_dir / f"cumulative_returns_chart_{sector}.png"))
+    print(f"✓ Saved cumulative_returns_chart_{sector}.png")
+  except Exception as e:
+    print(f"Warning: Could not generate cumulative returns chart: {e}")
+
+  # 2. Log Returns Chart
+  try:
+    qs.plots.log_returns(portReturns, 'SPY', savefig=str(output_dir / f"log_returns_{sector}.png"))
+    print(f"✓ Saved log_returns_{sector}.png")
+  except Exception as e:
+    print(f"Warning: Could not generate log returns chart: {e}")
+
+  # 3. Rolling Volatility Chart
+  try:
+    qs.plots.rolling_volatility(portReturns, savefig=str(output_dir / f"rolling_volatility_chart_{sector}.png"))
+    print(f"✓ Saved rolling_volatility_chart_{sector}.png")
+  except Exception as e:
+    print(f"Warning: Could not generate rolling volatility chart: {e}")
+
+  # 4. Rolling Sharpe Ratio Chart
+  try:
+    qs.plots.rolling_sharpe(portReturns, rf=rf, savefig=str(output_dir / f"rolling_sharpe_chart_{sector}.png"))
+    print(f"✓ Saved rolling_sharpe_chart_{sector}.png")
+  except Exception as e:
+    print(f"Warning: Could not generate rolling sharpe chart: {e}")
+
+  # 5. Rolling Sortino Ratio Chart
+  try:
+    qs.plots.rolling_sortino(portReturns, rf=rf, savefig=str(output_dir / f"rolling_sortino_chart_{sector}.png"))
+    print(f"✓ Saved rolling_sortino_chart_{sector}.png")
+  except Exception as e:
+    print(f"Warning: Could not generate rolling sortino chart: {e}")
+
+  # 6. Rolling Beta Chart
+  try:
+    qs.plots.rolling_beta(portReturns, 'SPY', savefig=str(output_dir / f"rolling_beta_chart_{sector}.png"))
+    print(f"✓ Saved rolling_beta_chart_{sector}.png")
+  except Exception as e:
+    print(f"Warning: Could not generate rolling beta chart: {e}")
+
+  # 7. Yearly Returns Chart
+  try:
+    qs.plots.yearly_returns(portReturns, 'SPY', savefig=str(output_dir / f"yearly_returns_{sector}.png"))
+    print(f"✓ Saved yearly_returns_{sector}.png")
+  except Exception as e:
+    print(f"Warning: Could not generate yearly returns chart: {e}")
+
+  # 8. Drawdown Periods Chart
+  try:
+    qs.plots.drawdowns_periods(portReturns, savefig=str(output_dir / f"drawdown_periods_{sector}.png"))
+    print(f"✓ Saved drawdown_periods_{sector}.png")
+  except Exception as e:
+    print(f"Warning: Could not generate drawdown periods chart: {e}")
+
+  # 9. Earnings Chart (if applicable)
+  try:
+    qs.plots.earnings(portReturns, savefig=str(output_dir / f"earnings_{sector}.png"))
+    print(f"✓ Saved earnings_{sector}.png")
+  except Exception as e:
+    print(f"Note: Earnings chart not applicable: {e}")
+
+  # 10. Snapshot Summary Chart
+  try:
+    qs.plots.snapshot(portReturns, 'SPY', title=f'{sector} Performance Snapshot',
+                     savefig=str(output_dir / f"snapshot_{sector}.png"))
+    print(f"✓ Saved snapshot_{sector}.png")
+  except Exception as e:
+    print(f"Warning: Could not generate snapshot chart: {e}")
 
   histogram = metrics.loc[metrics.index.isin(['MTD', '3M', '6M', 'YTD', '1Y']), ['Benchmark (SPY)', 'Strategy']]
   df = pd.DataFrame(histogram, index=['MTD', '3M', '6M', 'YTD', '1Y'])
 
   # Create a grouped bar plot
-  sns.set(style="whitegrid")
+  sns.set_theme(style="whitegrid")
   plt.figure(figsize=(10, 6))
 
   ax = df.plot(kind='bar', width=0.7)
@@ -775,7 +993,7 @@ def generate_report(folder, filename, start_date, sector='Portfolio', rf=0.):
                   ha='center', va='center', fontsize=10, color='black',
                   xytext=(0, 10), textcoords='offset points')
   plt.tight_layout()
-  plt.savefig(f"histogram_{sector}.png")
+  plt.savefig(output_dir / f"histogram_{sector}.png")
   plt.show()
 
   full = qs.reports.full(portReturns, benchmark='SPY', rf=rf, grayscale=False,
@@ -783,7 +1001,7 @@ def generate_report(folder, filename, start_date, sector='Portfolio', rf=0.):
           periods_per_year=252, match_dates=False)
 
   doc = qs.reports.html(portReturns, benchmark='SPY', rf=rf, grayscale=False,
-          title=f'{sector} Investment Returns', output=f'./{sector}_Tearsheet_{datetime.date.today()}.html', compounded=True,
+          title=f'{sector} Investment Returns', output=str(output_dir / f'{sector}_Tearsheet_{datetime.date.today()}.html'), compounded=True,
           periods_per_year=252, download_filename='quantstats-tearsheet.html',
           figfmt='svg', template_path=None, match_dates=False)
 
@@ -809,8 +1027,8 @@ def generate_report(folder, filename, start_date, sector='Portfolio', rf=0.):
 import warnings
 warnings.filterwarnings("ignore")
 
-generate_report('./', 'exchange_trnsactions', '2020-04-29')
-
+generate_report('./', 'exchange_transactions', '2020-04-29')
+'''
 # %%
 # Make Sector Tearsheets
 
@@ -831,7 +1049,7 @@ sectors_dict = {
   }
 
 # Load the transaction data from the CSV file
-portfolio_df = read_csv('./', 'exchange_trnsactions')
+portfolio_df = read_csv('./', 'exchange_transactions')
 
 # Iterate over the sectors in the sectors_dict
 for sector, symbols in sectors_dict.items():
@@ -852,5 +1070,5 @@ generate_report('./', 'Consumer Staples_TransactionHistory2020-2022_withCash', '
 generate_report('./', 'Utilities_TransactionHistory2020-2022_withCash', '2020-04-30', 'Utilities')
 generate_report('./', 'Materials_TransactionHistory2020-2022_withCash', '2020-04-30', 'Materials')
 generate_report('./', 'Energy_TransactionHistory2020-2022_withCash', '2020-04-30', 'Energy')
-
+'''
 

@@ -5,7 +5,9 @@
       "Bash(pip install:*)",
       "Bash(.venv/bin/pip:*)",
       "Bash(ls:*)",
-      "Bash(.venv/bin/python:*)"
+      "Bash(.venv/bin/python:*)",
+      "Bash(uv pip install:*)",
+      "Bash(python:*)"
     ]
   }
 }
